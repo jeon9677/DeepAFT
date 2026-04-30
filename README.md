@@ -75,34 +75,6 @@ $$\log T_i = g(X_i) + \varepsilon_i, \quad \varepsilon_i \sim \mathcal{N}(0,\,\s
 
 $$C_i \sim \mathrm{Uniform}(0,\,\tau), \quad Y_i = \min(T_i, C_i, \tau), \quad \delta_i = \mathbf{1}[T_i \le C_i \text{ and } T_i \le \tau]$$
 
-### Non-linear prognostic index
-
-$$g(X) = X_1 X_2 \;-\; 0.2\,X_3^3 \;+\; \sin(X_4 X_5) \;-\; 0.5\,X_5$$
-
-Columns $X_6, \ldots, X_p$ are pure noise variables (zero weight).
-
-Alternative error distributions (commented out in `generate_data.py`):
-
-| Distribution | Expression |
-|---|---|
-| Gaussian (default) | $\varepsilon \sim \mathcal{N}(0, \sigma)$ |
-| Student-t | $\varepsilon \sim t(\mathrm{df}) / 2$ |
-| Gumbel | $\varepsilon \sim \mathrm{Gumbel}(\mathrm{loc}, \mathrm{scale})$ |
-
----
-
-## Data Splits
-
-```
-Full data  (n)
- ├── 70 %  →  train_pool     (stratified on δ)
- │    ├── 5/7  →  train_core   (model optimisation)
- │    └── 2/7  →  val          (early stopping / LR schedule)
- └── 30 %  →  test             (final evaluation only)
-```
-
-Final proportions: **50 % / 20 % / 30 %**.
-
 ---
 
 ## Model
