@@ -1,518 +1,617 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Multi-Output CNN with MC-Dropout for Malaria Data
-==================================================
+DeepGP-like Log-normal AFT with MC-Dropout
+===========================================
 
-Two model architectures are trained and compared on a real malaria dataset:
-  - **Ours**  : deeper per-head architecture with head-level dropout
-  - **Old-3** : classic flat-merge architecture (baseline)
+Stratified 50/20/30 split (train / val / test) via two-step stratification:
+  1. 70 % stratified  →  train_pool  vs  test
+  2. train_pool  →  stratified  5/7  train_core  and  2/7  val
+     (final proportions: 50 % / 20 % / 30 % of total)
 
-Each model predicts three outcomes simultaneously:
-  y1 (binary)      → Binary cross-entropy  + sigmoid output
-  y2 (count)       → Poisson deviance      + exponential output
-  y3 (continuous)  → MSE                   + linear output (z-standardised during training)
+The model is trained on train_core, validated on val, and evaluated on test.
 
-Loss weights are calibrated automatically from a mini-batch before training.
-Uncertainty is estimated via Monte-Carlo Dropout (N_MC forward passes at inference).
+Outputs (under ``simul/<setting>/``)
+-------------------------------------
+  seed_<seed>_train.csv       raw training split
+  seed_<seed>_test.csv        raw test split
+  metrics_seed_<seed>.csv     per-seed evaluation metrics
+  metrics_summary.csv         aggregated metrics across all seeds
 
-Outputs (under ``Data/malaria/``)
-----------------------------------
-  y1_binary_prob_mean_ours_update3.ny
-  y2_count_lambda_mean_ours_update3.ny
-  y3_continuous_pred_mean_ours_update3.ny
-  y1_binary_prob_mean_old3_update3.ny
-  y2_count_lambda_mean_old3_update3.ny
-  y3_continuous_pred_mean_old3_update3.ny
-  y{1,2,3}_*_true_update3.ny
-  metrics_comparison_update3.csv
+Metrics
+-------
+  rmse_logT            RMSE of log(T) on event-only rows
+  mae_logT             MAE  of log(T) on event-only rows
+  ipcw_rmse_logT       IPCW-weighted RMSE of log(T)
+  rmse_time_median     RMSE of median survival time T on event-only rows
+  mae_time_median      MAE  of median survival time T on event-only rows
+  cindex_median_ipcw   IPCW C-index using predicted median T
+  runtime_seconds      wall-clock training time per seed
 """
 
 from __future__ import annotations
 
-import csv
 import os
+import time
+import argparse
 from pathlib import Path
-from typing import Any
 
 import numpy as np
+import pandas as pd
 import tensorflow as tf
-from sklearn.metrics import (
-    accuracy_score,
-    mean_poisson_deviance,
-    r2_score,
-    roc_curve,
-)
-from tensorflow.keras import Input, Model
-from tensorflow.keras.layers import (
-    Conv1D,
-    Dense,
-    Dropout,
-    Flatten,
-    MaxPooling1D,
-    concatenate,
-)
+from tensorflow.keras import layers as L, Model, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DATA_DIR = Path("Data/malaria")
-SEQ_LEN = 239        # length of the 1-D spectral / sequence input
-N_MC = 100           # MC-Dropout inference passes
-BATCH_SIZE = 64
-EPOCHS_OURS = 300
-EPOCHS_OLD3 = 1000
-PATIENCE = 30
-LR = 1e-3
+PI = tf.constant(np.pi, dtype=tf.float32)
+SQRT2 = tf.constant(np.sqrt(2.0), dtype=tf.float32)
+LOG_HALF = tf.math.log(tf.constant(0.5, dtype=tf.float32))
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# Reproducibility
 # ---------------------------------------------------------------------------
-def save_np(arr: np.ndarray, path: os.PathLike) -> None:
-    """Save a numpy array to disk."""
-    with open(path, "wb") as f:
-        np.save(f, arr)
+def set_seed(seed: int = 1000) -> None:
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
 
 
-def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.sqrt(np.mean((y_true.reshape(-1) - y_pred.reshape(-1)) ** 2)))
+# ---------------------------------------------------------------------------
+# Data generation
+# ---------------------------------------------------------------------------
+def make_ar1_cov(p: int, rho: float = 0.3) -> np.ndarray:
+    """AR(1) covariance matrix of size (p, p)."""
+    idx = np.arange(p)
+    return rho ** np.abs(idx[:, None] - idx[None, :])
 
 
-def brier_score(y_true: np.ndarray, p_hat: np.ndarray) -> float:
-    return float(np.mean((y_true.reshape(-1) - p_hat.reshape(-1)) ** 2))
+def g_nonlinear(X: np.ndarray) -> np.ndarray:
+    """Non-linear prognostic index used to generate log(T)."""
+    p = X.shape[1]
 
+    def _col(k):
+        return X[:, k] if k < p else 0.0
 
-def ensure_3d(x: np.ndarray) -> np.ndarray:
-    """Ensure input array has shape (N, SEQ_LEN, 1)."""
-    x = np.asarray(x)
-    if x.ndim == 2 and x.shape[1] == SEQ_LEN:
-        return x[..., None]
-    if x.ndim == 3 and x.shape[1] == SEQ_LEN and x.shape[2] == 1:
-        return x
-    raise ValueError(
-        f"Unexpected X shape {x.shape}; expected (N, {SEQ_LEN}) or (N, {SEQ_LEN}, 1)."
+    g = (
+        _col(0) * _col(1)
+        + 0.5 * (_col(2) ** 3)
+        + _col(3) * _col(4)
+        - 0.8 * _col(5)
     )
+    if p > 6:
+        w = np.linspace(0.5, 0.1, num=p - 6)
+        g = g + (X[:, 6:] @ w)
+    return g
 
 
-def find_best_threshold_youden(y_true: np.ndarray, p_hat: np.ndarray) -> float:
-    """Youden-J optimal classification threshold from the ROC curve."""
-    fpr, tpr, thr = roc_curve(y_true.reshape(-1), p_hat.reshape(-1))
-    best = thr[np.argmax(tpr - fpr)]
-    return float(np.clip(best, 1e-6, 1 - 1e-6))
-
-
-# ---------------------------------------------------------------------------
-# MC-Dropout layer helper
-# ---------------------------------------------------------------------------
-def mc_dropout(x: Any, rate: float = 0.25, training: bool = True) -> Any:
-    """Dropout applied with ``training=True`` even at inference (MC-Dropout)."""
-    return Dropout(rate)(x, training=training)
-
-
-# ---------------------------------------------------------------------------
-# Automatic loss-weight calibration
-# ---------------------------------------------------------------------------
-def compute_initial_loss_weights(
-    model: Model,
-    X_inputs: list[np.ndarray],
-    y_dict: dict[str, np.ndarray],
-    frac: float = 0.25,
-) -> dict[str, float]:
+def generate_correlated_data(
+    n: int = 1000,
+    p: int = 30,
+    sigma: float = 0.5,
+    tau: float = 7.0,
+    rho: float = 0.3,
+    seed: int = 1000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Estimate inverse-loss weights from a random mini-batch so that all
-    task losses start at a comparable scale.
+    Generate log-normal AFT survival data with AR(1) covariates.
 
     Parameters
     ----------
-    model    : compiled Keras model
-    X_inputs : list of input arrays  [X_seq, X_cov]
-    y_dict   : dict mapping output name → target array
-    frac     : fraction of training data to sample for calibration
+    n     : sample size
+    p     : number of covariates
+    sigma : variance of the log-normal error  (epsilon ~ N(0, sigma))
+    tau   : administrative censoring time
+    rho   : AR(1) correlation parameter
+    seed  : random seed
 
     Returns
     -------
-    weights  : dict of loss weights normalised so their mean equals 1
+    X          : (n, p) float32 covariates
+    y          : (n,)   float32 observed times  min(T, C, tau)
+    delta      : (n,)   float32 event indicators
+    mu_true    : (n,)   float32 true log(T) means
+    sigma_true : (n,)   float32 true log(T) std (constant = sqrt(sigma))
     """
-    n = X_inputs[0].shape[0]
-    m = max(32, int(n * frac))
-    idx = np.random.choice(n, m, replace=False)
-
-    batch = [X_inputs[0][idx], X_inputs[1][idx]]
-    yb = {k: v[idx] for k, v in y_dict.items()}
-
-    # deterministic forward pass for calibration
-    p_bin, lam_cnt, mu_reg = model(batch, training=False)
-
-    L = np.array([
-        tf.keras.losses.binary_crossentropy(yb["y1_binary"], p_bin).numpy().mean(),
-        tf.keras.losses.poisson(yb["y2_count"], lam_cnt).numpy().mean(),
-        tf.keras.losses.mse(yb["y3_continuous"], mu_reg).numpy().mean(),
-    ])
-    inv = 1.0 / (L + 1e-8)
-    inv = inv * (inv.size / inv.mean())  # normalise so mean == 1
-
-    weights = {
-        "y1_binary":     float(inv[0]),
-        "y2_count":      float(inv[1]),
-        "y3_continuous": float(inv[2]),
-    }
-    print(
-        f"[loss_weights] y1={weights['y1_binary']:.3f}  "
-        f"y2={weights['y2_count']:.3f}  "
-        f"y3={weights['y3_continuous']:.3f}"
-    )
-    return weights
-
-
-# ---------------------------------------------------------------------------
-# Model architectures
-# ---------------------------------------------------------------------------
-def build_model_ours(mc: bool = True) -> Model:
-    """
-    Our proposed architecture.
-
-    Shared CNN backbone → three independent heads, each with a dedicated
-    dense layer, head-level dropout, and covariate concatenation.
-    """
-    X_seq = Input(shape=(SEQ_LEN, 1), name="X_phi")
-    cov   = Input(shape=(1,),         name="covariate")
-
-    # --- shared backbone ---
-    x = Conv1D(32, 3, activation="tanh")(X_seq)
-    x = mc_dropout(x, rate=0.25, training=mc)
-    x = MaxPooling1D()(x)
-
-    x = Conv1D(64, 3, activation="tanh")(x)
-    x = mc_dropout(x, rate=0.25, training=mc)
-    x = MaxPooling1D()(x)
-
-    x = Flatten()(x)
-    x = Dense(32, activation="relu")(x)
-    x = mc_dropout(x, rate=0.25, training=mc)
-
-    # --- per-task heads ---
-    def _head(trunk, activation: str, name: str) -> Any:
-        h = Dense(8, activation="relu")(trunk)
-        h = mc_dropout(h, rate=0.10, training=mc)
-        h = concatenate([h, cov])
-        return Dense(1, activation=activation, name=name)(h)
-
-    y1 = _head(x, "sigmoid",     "y1_binary")
-    y2 = _head(x, "exponential", "y2_count")       # ensures λ > 0
-    y3 = _head(x, "linear",      "y3_continuous")
-
-    return Model(inputs=[X_seq, cov], outputs=[y1, y2, y3], name="model_ours")
-
-
-def build_model_old3(mc: bool = True) -> Model:
-    """
-    Baseline architecture.
-
-    Shared CNN backbone → single merged representation with covariate →
-    three output heads (no per-head sub-networks).
-    """
-    X_seq = Input(shape=(SEQ_LEN, 1), name="X_phi")
-    cov   = Input(shape=(1,),         name="cov")
-
-    x = Conv1D(32, 3, activation="tanh")(X_seq)
-    x = mc_dropout(x, rate=0.25, training=mc)
-    x = MaxPooling1D()(x)
-
-    x = Conv1D(64, 3, activation="tanh")(x)
-    x = mc_dropout(x, rate=0.25, training=mc)
-    x = MaxPooling1D()(x)
-
-    x = Flatten()(x)
-    x = Dense(32, activation="relu")(x)
-    x = mc_dropout(x, rate=0.25, training=mc)
-    x = Dense(16, activation="linear")(x)
-
-    merged = concatenate([x, cov], name="merged")
-
-    y1 = Dense(1, activation="sigmoid",     name="y1_binary")(merged)
-    y2 = Dense(1, activation="exponential", name="y2_count")(merged)
-    y3 = Dense(1, activation="linear",      name="y3_continuous")(merged)
-
-    return Model(inputs=[X_seq, cov], outputs=[y1, y2, y3], name="model_old3")
-
-
-def compile_model(model: Model, lr: float, loss_weights: dict | None = None) -> None:
-    """Compile a multi-output model with task-specific losses and metrics."""
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr),
-        loss={
-            "y1_binary":     "binary_crossentropy",
-            "y2_count":      tf.keras.losses.Poisson(),
-            "y3_continuous": "mse",
-        },
-        loss_weights=loss_weights,
-        metrics={
-            "y1_binary": [
-                tf.keras.metrics.BinaryAccuracy(name="accuracy"),
-                tf.keras.metrics.AUC(name="auc"),
-                tf.keras.metrics.AUC(name="auprc", curve="PR"),
-            ],
-            "y2_count":      ["mse"],
-            "y3_continuous": ["mse"],
-        },
+    set_seed(seed)
+    Sigma = make_ar1_cov(p, rho=rho) + 1e-8 * np.eye(p)
+    X = np.random.multivariate_normal(mean=np.zeros(p), cov=Sigma, size=n).astype(
+        np.float32
     )
 
+    gX = g_nonlinear(X)
+    eps = np.random.normal(0.0, np.sqrt(sigma), size=n)
+    logT = gX + eps
+    T = np.exp(logT)
 
-def _make_callbacks() -> list:
-    return [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_y1_binary_auc",
-            mode="max",
-            patience=PATIENCE,
-            restore_best_weights=True,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=10,
-            min_lr=1e-5,
-            verbose=1,
-        ),
-    ]
+    C = np.random.uniform(0, tau, size=n)
+    y = np.minimum(np.minimum(T, C), tau)
+    delta = ((T <= C) & (T <= tau)).astype(np.float32)
+
+    mu_true = gX.astype(np.float32)
+    sigma_true = np.full_like(mu_true, fill_value=np.sqrt(sigma), dtype=np.float32)
+
+    return X.astype(np.float32), y.astype(np.float32), delta, mu_true, sigma_true
 
 
 # ---------------------------------------------------------------------------
-# Training helper
+# Stratified splitting utilities
 # ---------------------------------------------------------------------------
-def fit_model(
+def _stratified_train_test_split(
+    df: pd.DataFrame,
+    label_col: str = "delta",
+    train_frac: float = 0.7,
+    seed: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Stratified binary-label train/test split."""
+    rng = np.random.default_rng(seed)
+    train_parts, test_parts = [], []
+    for val in sorted(df[label_col].unique()):
+        block = df[df[label_col] == val]
+        idx = block.index.to_numpy()
+        rng.shuffle(idx)
+        n_train = int(np.floor(train_frac * len(idx)))
+        train_parts.append(block.loc[idx[:n_train]])
+        test_parts.append(block.loc[idx[n_train:]])
+    train_df = pd.concat(train_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    test_df = pd.concat(test_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return train_df, test_df
+
+
+def _stratified_split(
+    df: pd.DataFrame,
+    label_col: str = "delta",
+    frac: float = 0.5,
+    seed: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (A, B) where A receives ``frac`` proportion per class."""
+    rng = np.random.default_rng(seed)
+    A_parts, B_parts = [], []
+    for val in sorted(df[label_col].unique()):
+        block = df[df[label_col] == val]
+        idx = block.index.to_numpy()
+        rng.shuffle(idx)
+        n_A = int(np.floor(frac * len(idx)))
+        A_parts.append(block.loc[idx[:n_A]])
+        B_parts.append(block.loc[idx[n_A:]])
+    A = pd.concat(A_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    B = pd.concat(B_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return A, B
+
+
+# ---------------------------------------------------------------------------
+# IPCW helpers (Kaplan–Meier estimate of the censoring distribution)
+# ---------------------------------------------------------------------------
+def _km_survival_of_censoring(y: np.ndarray, delta: np.ndarray) -> np.ndarray:
+    """Kaplan–Meier estimate of G(t) = P(C > t) evaluated at each observed time."""
+    y = np.asarray(y, dtype=float)
+    delta = np.asarray(delta, dtype=int)
+    c = 1 - delta  # censoring indicator
+    uniq = np.unique(y)
+    r = np.array([(y >= t).sum() for t in uniq], dtype=float)
+    d = np.array([c[y == t].sum() for t in uniq], dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        step = 1.0 - np.divide(d, r, out=np.zeros_like(d), where=(r > 0))
+    G_at_times = np.cumprod(step, dtype=float)
+    idx = np.searchsorted(uniq, y, side="right") - 1
+    G_hat = np.where(idx >= 0, G_at_times[idx], 1.0)
+    return np.clip(G_hat, 1e-12, 1.0)
+
+
+def c_index_ipcw_rstyle(
+    y: np.ndarray,
+    delta: np.ndarray,
+    t_pred: np.ndarray,
+    censor_prob: np.ndarray | None = None,
+) -> float:
+    """IPCW C-index (Uno et al. style)."""
+    y = np.asarray(y, dtype=float)
+    delta = np.asarray(delta, dtype=int)
+    t_pred = np.asarray(t_pred, dtype=float)
+    ok = np.isfinite(y) & np.isfinite(delta) & np.isfinite(t_pred) & (y > 0)
+    y, delta, t_pred = y[ok], delta[ok], t_pred[ok]
+    n = len(y)
+    if n < 2:
+        return np.nan
+    G_hat = (
+        _km_survival_of_censoring(y, delta)
+        if censor_prob is None
+        else np.clip(np.asarray(censor_prob, dtype=float), 1e-12, 1.0)
+    )
+    num, den = 0.0, 0.0
+    idx_all = np.arange(n)
+    for i in range(n):
+        if delta[i] != 1:
+            continue
+        w = delta[i] / (G_hat[i] ** 2)
+        mask = (idx_all != i) & (y[i] < y)
+        cnt = int(mask.sum())
+        if cnt == 0:
+            continue
+        den += w * cnt
+        num += w * int((mask & (t_pred[i] < t_pred)).sum())
+    return float(num / den) if den > 0 else np.nan
+
+
+def ipcw_rmse_logT(
+    y: np.ndarray,
+    delta: np.ndarray,
+    mu_hat: np.ndarray,
+    censor_prob: np.ndarray | None = None,
+) -> float:
+    """IPCW-weighted RMSE of log(T).  w_i = delta_i / G_hat(y_i)."""
+    y = np.asarray(y, dtype=float)
+    delta = np.asarray(delta, dtype=int)
+    mu_hat = np.asarray(mu_hat, dtype=float)
+    ok = np.isfinite(y) & np.isfinite(delta) & np.isfinite(mu_hat) & (y > 0)
+    y, delta, mu_hat = y[ok], delta[ok], mu_hat[ok]
+    G_hat = (
+        _km_survival_of_censoring(y, delta)
+        if censor_prob is None
+        else np.clip(np.asarray(censor_prob, dtype=float), 1e-12, 1.0)
+    )
+    w = delta / G_hat
+    num = np.sum(w * (np.log(y) - mu_hat) ** 2)
+    den = np.sum(w)
+    return float(np.sqrt(num / den)) if den > 0 else np.nan
+
+
+# ---------------------------------------------------------------------------
+# Model architecture & loss
+# ---------------------------------------------------------------------------
+def build_deepgp_aft(
+    input_dim: int = 30,
+    width: int = 128,
+    depth: int = 3,
+    dropout: float = 0.2,
+) -> Model:
+    """
+    Deep-GP-like AFT network with MC-Dropout.
+
+    Output head has two units: [mu, raw_scale].
+    sigma = softplus(raw_scale) + 1e-6 ensures positivity.
+    """
+    inp = Input(shape=(input_dim,), name="x")
+    x = inp
+    for d in range(depth):
+        x = L.Dense(width, activation="tanh", name=f"dense_{d}")(x)
+        x = L.Dropout(dropout, name=f"drop_{d}")(x)
+    out = L.Dense(2, activation=None, name="head_mu_raw")(x)
+    return Model(inp, out, name="DeepGP_AFT")
+
+
+def aft_lognormal_nll(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    """
+    Log-normal AFT negative log-likelihood.
+
+    y_true columns: [observed_time, event_indicator]
+    y_pred columns: [mu, raw_scale]
+    """
+    y = y_true[:, 0]
+    delta = y_true[:, 1]
+    mu = y_pred[:, 0]
+    sigma = tf.nn.softplus(y_pred[:, 1]) + 1e-6
+
+    y = tf.clip_by_value(y, 1e-30, 1e30)
+    logy = tf.math.log(y)
+    z = (logy - mu) / sigma
+
+    logf = (
+        -tf.math.log(y)
+        - tf.math.log(sigma)
+        - 0.5 * tf.math.log(2.0 * PI)
+        - 0.5 * tf.square(z)
+    )
+    erfc_val = tf.clip_by_value(tf.math.erfc(z / SQRT2), 1e-45, 1.0)
+    logS = LOG_HALF + tf.math.log(erfc_val)
+
+    nll = -(delta * logf + (1.0 - delta) * logS)
+    return tf.reduce_mean(nll)
+
+
+def predict_mu_sigma(
     model: Model,
-    X_train: list[np.ndarray],
-    y_train: dict[str, np.ndarray],
-    X_val: list[np.ndarray],
-    y_val: dict[str, np.ndarray],
-    epochs: int,
-) -> tf.keras.callbacks.History:
+    X: np.ndarray,
+    mc_passes: int = 30,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    1. Temporarily compile to measure initial loss scales.
-    2. Re-compile with calibrated loss weights.
-    3. Train with early stopping + LR schedule.
-    """
-    # Step 1: calibrate weights
-    compile_model(model, lr=LR, loss_weights=None)
-    init_w = compute_initial_loss_weights(model, X_train, y_train)
-
-    # Step 2: re-compile with weights
-    compile_model(model, lr=LR, loss_weights=init_w)
-
-    # Step 3: train
-    return model.fit(
-        X_train,
-        y_train,
-        validation_data=(X_val, y_val),
-        batch_size=BATCH_SIZE,
-        epochs=epochs,
-        callbacks=_make_callbacks(),
-        verbose=1,
-    )
-
-
-# ---------------------------------------------------------------------------
-# MC-Dropout inference
-# ---------------------------------------------------------------------------
-def mc_predict(
-    model: Model,
-    X: list[np.ndarray],
-    n_passes: int = N_MC,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Run ``n_passes`` stochastic forward passes with training=True.
+    Monte-Carlo Dropout inference.
 
     Returns
     -------
-    y1_mean : (N,) mean predicted probability for the binary outcome
-    y2_mean : (N,) mean predicted Poisson rate for the count outcome
-    y3_mean : (N,) mean predicted value for the continuous outcome (z-scale)
+    mu_mean    : (N,) mean predicted log(T) across MC samples
+    sigma_mean : (N,) mean predicted scale across MC samples
     """
-    y1_mc, y2_mc, y3_mc = [], [], []
-    for _ in range(n_passes):
-        p1, p2, p3 = model(X, training=True)
-        y1_mc.append(p1.numpy().reshape(-1, 1))
-        y2_mc.append(p2.numpy().reshape(-1, 1))
-        y3_mc.append(p3.numpy().reshape(-1, 1))
-
-    return (
-        np.hstack(y1_mc).mean(axis=1),
-        np.hstack(y2_mc).mean(axis=1),
-        np.hstack(y3_mc).mean(axis=1),
-    )
+    outs = []
+    for _ in range(mc_passes):
+        raw = model(X, training=True).numpy()
+        mu = raw[:, 0]
+        sigma = np.log1p(np.exp(raw[:, 1])) + 1e-6  # softplus
+        outs.append(np.stack([mu, sigma], axis=1))
+    outs = np.stack(outs, axis=0)  # (M, N, 2)
+    return outs[:, :, 0].mean(axis=0), outs[:, :, 1].mean(axis=0)
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Data generation & persistence
 # ---------------------------------------------------------------------------
-def evaluate(
-    label: str,
-    y1_true: np.ndarray,
-    y2_true: np.ndarray,
-    y3_true: np.ndarray,
-    y1_prob: np.ndarray,
-    y2_pred: np.ndarray,
-    y3_pred: np.ndarray,
-) -> dict[str, float]:
-    """Compute and print all metrics for one model."""
-    thr = find_best_threshold_youden(y1_true, y1_prob)
-
-    y1_acc_05 = accuracy_score(y1_true.reshape(-1), (y1_prob >= 0.5).astype(int))
-    y1_acc_bt = accuracy_score(y1_true.reshape(-1), (y1_prob >= thr).astype(int))
-    y1_brier  = brier_score(y1_true, y1_prob)
-
-    y2_rmse = rmse(y2_true, y2_pred)
-    y2_mpd  = float(mean_poisson_deviance(y2_true.reshape(-1), y2_pred.reshape(-1)))
-
-    y3_rmse = rmse(y3_true, y3_pred)
-    y3_r2   = float(r2_score(y3_true.reshape(-1), y3_pred.reshape(-1)))
-
-    print(f"\n=== {label} ===")
-    print(
-        f"y1  ACC@0.5={y1_acc_05:.4f}  ACC@Youden({thr:.3f})={y1_acc_bt:.4f}  "
-        f"Brier={y1_brier:.4f}"
-    )
-    print(f"y2  RMSE={y2_rmse:.4f}  MPD={y2_mpd:.4f}")
-    print(f"y3  RMSE={y3_rmse:.4f}  R²={y3_r2:.4f}")
-
-    return dict(
-        y1_acc_05=y1_acc_05,
-        y1_acc_best=y1_acc_bt,
-        y1_brier=y1_brier,
-        y2_rmse=y2_rmse,
-        y2_mpd=y2_mpd,
-        y3_rmse=y3_rmse,
-        y3_r2=y3_r2,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-def load_data(data_dir: Path) -> dict[str, np.ndarray]:
+def save_simulations(
+    p: int = 30,
+    sigma: float = 0.5,
+    n: int = 1000,
+    n_sims: int = 5,
+    rho: float = 0.3,
+    tau: float = 10.0,
+    base_seed: int = 1000,
+    outdir: str = "simul",
+    train_frac: float = 0.7,
+) -> Path:
     """
-    Load all pre-processed numpy arrays for training and validation.
+    Generate ``n_sims`` datasets and save train / test CSVs.
 
-    Expected files (``update3`` suffix):
-      X_train_basis_update3.ny   X_cv_basis_update3.ny
-      cov_data_update3.ny        cov_cv_update3.ny
-      Zmat_data_{bin,count,cont}_y1_update3.ny
-      Zmat_cv_{bin,count,cont}_y1_update3.ny
+    Returns the output directory ``Path``.
     """
-    def _load(fname: str) -> np.ndarray:
-        return np.load(data_dir / fname, allow_pickle=False)
+    setting_name = f"p{p}_sigma{sigma}_tau{tau}"
+    path = Path(outdir) / setting_name
+    path.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "X_train": ensure_3d(_load("X_train_basis_update3.ny")),
-        "X_val":   ensure_3d(_load("X_cv_basis_update3.ny")),
-        "cov_tr":  _load("cov_data_update3.ny").reshape(-1, 1),
-        "cov_va":  _load("cov_cv_update3.ny").reshape(-1, 1),
-        "y1_tr":   (_load("Zmat_data_bin_y1_update3.ny")   >= 0.5).astype(np.float32).reshape(-1, 1),
-        "y1_va":   (_load("Zmat_cv_bin_y1_update3.ny")     >= 0.5).astype(np.float32).reshape(-1, 1),
-        "y2_tr":   _load("Zmat_data_count_y1_update3.ny").astype(np.float32).reshape(-1, 1),
-        "y2_va":   _load("Zmat_cv_count_y1_update3.ny").astype(np.float32).reshape(-1, 1),
-        "y3_tr":   _load("Zmat_data_cont_y1_update3.ny").astype(np.float32).reshape(-1, 1),
-        "y3_va":   _load("Zmat_cv_cont_y1_update3.ny").astype(np.float32).reshape(-1, 1),
-    }
+    for k in range(n_sims):
+        seed = base_seed + k
+        print(f"[{setting_name}] Simulation {k + 1}/{n_sims}, seed={seed}")
+        X, y, delta, mu_true, sigma_true = generate_correlated_data(
+            n=n, p=p, sigma=sigma, tau=tau, rho=rho, seed=seed
+        )
+
+        df = pd.DataFrame(X, columns=[f"x{j + 1}" for j in range(p)])
+        df["y"] = y
+        df["delta"] = delta
+        df["mu_true"] = mu_true
+        df["sigma_true"] = sigma_true
+
+        train_df, test_df = _stratified_train_test_split(
+            df, label_col="delta", train_frac=train_frac, seed=seed
+        )
+
+        train_df.to_csv(path / f"seed_{seed}_train.csv", index=False)
+        test_df.to_csv(path / f"seed_{seed}_test.csv", index=False)
+
+        cr_overall = 1.0 - df["delta"].mean()
+        cr_train = 1.0 - train_df["delta"].mean()
+        cr_test = 1.0 - test_df["delta"].mean()
+        print(
+            f"  total n={len(df)} (censoring={cr_overall:.3f}) | "
+            f"train n={len(train_df)} (censoring={cr_train:.3f}) | "
+            f"test n={len(test_df)} (censoring={cr_test:.3f})"
+        )
+
+    print(f"Saved {n_sims} train/test pairs under {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Training & evaluation
 # ---------------------------------------------------------------------------
-def main() -> None:
-    tf.get_logger().setLevel("ERROR")
+def _df_to_xy(df: pd.DataFrame, p: int) -> tuple[np.ndarray, np.ndarray]:
+    """Extract (X, y_target) arrays from a dataframe."""
+    X = df[[f"x{j + 1}" for j in range(p)]].to_numpy(dtype=np.float32)
+    y = df["y"].to_numpy(dtype=np.float32)
+    d = df["delta"].to_numpy(dtype=np.float32)
+    y_target = np.stack([y, d], axis=1).astype(np.float32)
+    return X, y_target
 
-    # ------------------------------------------------------------------
-    # Load data
-    # ------------------------------------------------------------------
-    print(f"Loading data from {DATA_DIR} …")
-    d = load_data(DATA_DIR)
 
-    # z-standardise y3 (continuous target); restore at evaluation
-    y3_mean = float(d["y3_tr"].mean())
-    y3_std  = float(d["y3_tr"].std() + 1e-8)
-    y3_tr_z = (d["y3_tr"] - y3_mean) / y3_std
-    y3_va_z = (d["y3_va"] - y3_mean) / y3_std
+def train_and_eval_for_setting(
+    setting_path: Path,
+    p: int,
+    seeds: list[int] | None = None,
+    model_width: int = 128,
+    model_depth: int = 3,
+    dropout: float = 0.2,
+    lr: float = 1e-3,
+    batch_size: int = 128,
+    epochs: int = 500,
+    mc_passes: int = 30,
+    patience: int = 20,
+) -> pd.DataFrame:
+    """
+    Train and evaluate the DeepGP-AFT model for every available seed.
 
-    X_tr = [d["X_train"], d["cov_tr"]]
-    X_va = [d["X_val"],   d["cov_va"]]
+    If ``seeds`` is None, all seeds found in ``setting_path`` are used.
 
-    y_tr = {"y1_binary": d["y1_tr"], "y2_count": d["y2_tr"], "y3_continuous": y3_tr_z}
-    y_va = {"y1_binary": d["y1_va"], "y2_count": d["y2_va"], "y3_continuous": y3_va_z}
-
-    # ------------------------------------------------------------------
-    # Train: Our model
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("Training: OUR model")
-    print("=" * 60)
-    tf.keras.backend.clear_session()
-    model_ours = build_model_ours(mc=True)
-    fit_model(model_ours, X_tr, y_tr, X_va, y_va, epochs=EPOCHS_OURS)
-
-    y1_ours, y2_ours, y3_ours_z = mc_predict(model_ours, X_va)
-    y3_ours = y3_ours_z * y3_std + y3_mean
-
-    metrics_ours = evaluate(
-        "OUR model (MC mean)",
-        d["y1_va"], d["y2_va"], d["y3_va"],
-        y1_ours, y2_ours, y3_ours,
-    )
-
-    save_np(y1_ours,   DATA_DIR / "y1_binary_prob_mean_ours_update3.ny")
-    save_np(y2_ours,   DATA_DIR / "y2_count_lambda_mean_ours_update3.ny")
-    save_np(y3_ours,   DATA_DIR / "y3_continuous_pred_mean_ours_update3.ny")
-    save_np(d["y1_va"], DATA_DIR / "y1_binary_true_update3.ny")
-    save_np(d["y2_va"], DATA_DIR / "y2_count_true_update3.ny")
-    save_np(d["y3_va"], DATA_DIR / "y3_continuous_true_update3.ny")
-
-    # ------------------------------------------------------------------
-    # Train: Old-3 baseline
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("Training: OLD-3 baseline")
-    print("=" * 60)
-    tf.keras.backend.clear_session()
-    model_old3 = build_model_old3(mc=True)
-    fit_model(model_old3, X_tr, y_tr, X_va, y_va, epochs=EPOCHS_OLD3)
-
-    y1_old3, y2_old3, y3_old3_z = mc_predict(model_old3, X_va)
-    y3_old3 = y3_old3_z * y3_std + y3_mean
-
-    metrics_old3 = evaluate(
-        "OLD-3OUT baseline (MC mean)",
-        d["y1_va"], d["y2_va"], d["y3_va"],
-        y1_old3, y2_old3, y3_old3,
-    )
-
-    save_np(y1_old3, DATA_DIR / "y1_binary_prob_mean_old3_update3.ny")
-    save_np(y2_old3, DATA_DIR / "y2_count_lambda_mean_old3_update3.ny")
-    save_np(y3_old3, DATA_DIR / "y3_continuous_pred_mean_old3_update3.ny")
-
-    # ------------------------------------------------------------------
-    # Save metrics comparison CSV
-    # ------------------------------------------------------------------
-    csv_path = DATA_DIR / "metrics_comparison_update3.csv"
-    header = ["model", "y1_acc@0.5", "y1_acc@best", "y1_brier",
-              "y2_rmse", "y2_mpd", "y3_rmse", "y3_r2"]
-
-    def _row(name: str, m: dict) -> list:
-        return [
-            name,
-            f"{m['y1_acc_05']:.6f}",
-            f"{m['y1_acc_best']:.6f}",
-            f"{m['y1_brier']:.6f}",
-            f"{m['y2_rmse']:.6f}",
-            f"{m['y2_mpd']:.6f}",
-            f"{m['y3_rmse']:.6f}",
-            f"{m['y3_r2']:.6f}",
+    Returns a DataFrame of per-seed metrics.
+    """
+    # discover seeds
+    all_train_files = sorted(setting_path.glob("seed_*_train.csv"))
+    if seeds is not None:
+        seed_set = set(seeds)
+        all_train_files = [
+            f for f in all_train_files
+            if int(f.stem.split("_")[1]) in seed_set
         ]
 
-    with open(csv_path, "w", newline="") as f:
-        csv.writer(f).writerows([header, _row("ours", metrics_ours), _row("old3", metrics_old3)])
+    metrics_rows = []
 
-    print(f"\nMetrics saved to: {csv_path}")
+    for train_csv in all_train_files:
+        seed = int(train_csv.stem.split("_")[1])
+        test_csv = setting_path / f"seed_{seed}_test.csv"
+        if not test_csv.exists():
+            print(f"  [seed={seed}] test file not found – skipping.")
+            continue
+
+        # ------------------------------------------------------------------
+        # Split: train_pool  →  val (2/7)  +  train_core (5/7)
+        # ------------------------------------------------------------------
+        train_pool = pd.read_csv(train_csv)
+        val_df, train_core_df = _stratified_split(
+            train_pool, label_col="delta", frac=2.0 / 7.0, seed=seed
+        )
+        test_df = pd.read_csv(test_csv)
+
+        X_tr, y_tr = _df_to_xy(train_core_df, p)
+        X_va, y_va = _df_to_xy(val_df, p)
+        X_te, y_te = _df_to_xy(test_df, p)
+
+        # ------------------------------------------------------------------
+        # Build & train
+        # ------------------------------------------------------------------
+        tf.keras.backend.clear_session()
+        model = build_deepgp_aft(
+            input_dim=p, width=model_width, depth=model_depth, dropout=dropout
+        )
+        model.compile(optimizer=Adam(lr), loss=aft_lognormal_nll)
+
+        callbacks = [
+            EarlyStopping(patience=patience, restore_best_weights=True, monitor="val_loss"),
+            ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=8, min_lr=1e-5),
+        ]
+
+        t0 = time.time()
+        model.fit(
+            X_tr, y_tr,
+            validation_data=(X_va, y_va),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=0,
+        )
+        runtime = time.time() - t0
+
+        # ------------------------------------------------------------------
+        # Predict & evaluate
+        # ------------------------------------------------------------------
+        mu_hat, _ = predict_mu_sigma(model, X_te, mc_passes=mc_passes)
+        y_test = y_te[:, 0]
+        d_test = y_te[:, 1]
+        medT_hat = np.exp(mu_hat)
+
+        def _rmse(a, b):
+            return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b)) ** 2)))
+
+        def _mae(a, b):
+            return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
+
+        evt = d_test == 1
+        if evt.sum() > 0:
+            rmse_logT = _rmse(np.log(y_test[evt]), mu_hat[evt])
+            mae_logT = _mae(np.log(y_test[evt]), mu_hat[evt])
+            rmse_time_med = _rmse(y_test[evt], medT_hat[evt])
+            mae_time_med = _mae(y_test[evt], medT_hat[evt])
+        else:
+            rmse_logT = mae_logT = rmse_time_med = mae_time_med = np.nan
+
+        ipcw_rmse = ipcw_rmse_logT(y_test, d_test, mu_hat)
+        cindex_ipcw = c_index_ipcw_rstyle(y_test, d_test, medT_hat)
+
+        row = dict(
+            seed=seed,
+            n_test=len(y_test),
+            n_events=int(evt.sum()),
+            rmse_logT=rmse_logT,
+            mae_logT=mae_logT,
+            ipcw_rmse_logT=ipcw_rmse,
+            rmse_time_median=rmse_time_med,
+            mae_time_median=mae_time_med,
+            cindex_median_ipcw=cindex_ipcw,
+            runtime_seconds=runtime,
+        )
+        pd.DataFrame([row]).to_csv(setting_path / f"metrics_seed_{seed}.csv", index=False)
+        metrics_rows.append(row)
+
+        print(
+            f"[{setting_path.name}] seed={seed} | "
+            f"rmse_logT={rmse_logT:.3f}  ipcw_rmse_logT={ipcw_rmse:.3f}  "
+            f"cindex_ipcw={cindex_ipcw:.3f}  ({runtime:.1f}s)"
+        )
+
+    if not metrics_rows:
+        print("No metrics computed – no valid seeds found.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(metrics_rows)
+    df.to_csv(setting_path / "metrics_summary.csv", index=False)
+
+    agg_cols = [
+        "rmse_logT", "ipcw_rmse_logT", "rmse_time_median",
+        "cindex_median_ipcw", "runtime_seconds",
+    ]
+    print("\nAggregate (mean ± std):")
+    print(df[agg_cols].agg(["mean", "std"]).to_string())
+    return df
+
+
+def infer_p_from_setting(setting_path: Path) -> int:
+    """Infer number of covariates from an arbitrary train CSV in ``setting_path``."""
+    any_train = next(setting_path.glob("seed_*_train.csv"))
+    cols = pd.read_csv(any_train, nrows=1).columns.tolist()
+    return sum(1 for c in cols if c.startswith("x"))
+
+
+# ---------------------------------------------------------------------------
+# CLI entry-point
+# ---------------------------------------------------------------------------
+def _parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Train & evaluate DeepGP-AFT on pre-generated survival data.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument(
+        "--setting",
+        type=str,
+        required=True,
+        help="Sub-directory name under --base_dir, e.g. p30_sigma0.5_tau10.0",
+    )
+    ap.add_argument("--base_dir", type=str, default="simul", help="Root directory for simulations.")
+    ap.add_argument("--first_seed", type=int, default=1000, help="First seed index.")
+    ap.add_argument("--n_seeds", type=int, default=100, help="Number of consecutive seeds to evaluate.")
+    ap.add_argument("--width", type=int, default=128, help="Hidden layer width.")
+    ap.add_argument("--depth", type=int, default=3, help="Number of hidden layers.")
+    ap.add_argument("--dropout", type=float, default=0.2, help="MC-Dropout rate.")
+    ap.add_argument("--lr", type=float, default=1e-3, help="Initial Adam learning rate.")
+    ap.add_argument("--batch_size", type=int, default=128)
+    ap.add_argument("--epochs", type=int, default=500, help="Maximum training epochs.")
+    ap.add_argument("--mc_passes", type=int, default=30, help="MC-Dropout inference passes.")
+    ap.add_argument("--patience", type=int, default=20, help="Early-stopping patience.")
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+
+    setting_path = Path(args.base_dir) / args.setting
+    if not setting_path.exists():
+        raise FileNotFoundError(f"Setting directory not found: {setting_path}")
+
+    p = infer_p_from_setting(setting_path)
+    print(f"Inferred p={p} covariates from {setting_path}")
+
+    candidate_seeds = range(args.first_seed, args.first_seed + args.n_seeds)
+    seeds = [
+        s for s in candidate_seeds
+        if (setting_path / f"seed_{s}_train.csv").exists()
+        and (setting_path / f"seed_{s}_test.csv").exists()
+    ]
+    if not seeds:
+        raise FileNotFoundError(
+            f"No seed_*_train/test.csv files found in {setting_path} "
+            f"for seeds {args.first_seed}..{args.first_seed + args.n_seeds - 1}."
+        )
+    print(f"Found {len(seeds)} seeds: {seeds[0]} … {seeds[-1]}")
+
+    train_and_eval_for_setting(
+        setting_path=setting_path,
+        p=p,
+        seeds=seeds,
+        model_width=args.width,
+        model_depth=args.depth,
+        dropout=args.dropout,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        mc_passes=args.mc_passes,
+        patience=args.patience,
+    )
 
 
 if __name__ == "__main__":
